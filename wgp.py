@@ -97,6 +97,31 @@ import requests
 from shared.gradio.gallery import AdvancedMediaGallery
 from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
+# Ensure a plugin app instance exists when running as an imported module (e.g. on Hugging Face Spaces)
+try:
+    app  # type: ignore[name-defined]
+except NameError:
+    try:
+        app = WAN2GPApplication()
+        print("[Plugin] WAN2GPApplication created for imported context.")
+    except Exception as _e:
+        # Fallback dummy app: disable plugin features but keep the UI working
+        class _DummyPluginApp:
+            def initialize_plugins(self, globals_dict):
+                print("[Plugin] Dummy initialize_plugins (no-op).")
+
+            def run_component_insertion(self, locals_dict):
+                print("[Plugin] Dummy run_component_insertion (no-op).")
+
+            def setup_ui_tabs(self, *args, **kwargs):
+                print("[Plugin] Dummy setup_ui_tabs (no-op).")
+
+            def get_tab_order(self):
+                return []
+
+        app = _DummyPluginApp()
+        print(f"[Plugin] Using DummyPluginApp due to error: {_e}")
+
 from collections import defaultdict
 
 # import torch._dynamo as dynamo
