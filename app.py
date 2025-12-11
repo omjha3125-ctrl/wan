@@ -2,55 +2,59 @@ import os
 import sys
 import re
 import types
-import runpy
-import importlib
-import inspect
 import pathlib
 
+# Avoid audio backend issues
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
+
 def patch_mmgp_offload():
-    """Patch mmgp.offload to remove torch.nn.Buffer usage"""
+    """Patch mmgp.offload to remove torch.nn.Buffer(...) which breaks on some envs."""
     try:
         import mmgp
+
         offload_path = pathlib.Path(mmgp.__file__).with_name("offload.py")
+        if not offload_path.exists():
+            print("[mmgp] offload.py not found, skipping mmgp patch.")
+            return
+
         text = offload_path.read_text()
-        if "torch.nn.Buffer(" in text:
-            # naive but safe: remove torch.nn.Buffer wrapper
-            text_new = re.sub(
+        if "torch.nn.Buffer" in text:
+            new_text = re.sub(
                 r"torch\.nn\.Buffer\((.*?)\)",
                 r"\1",
                 text,
                 flags=re.DOTALL,
             )
-            if text_new != text:
-                offload_path.write_text(text_new)
-                print("[OK] Patched mmgp.offload (removed torch.nn.Buffer).")
+            if new_text != text:
+                offload_path.write_text(new_text)
+                print("✅ Patched mmgp.offload (removed torch.nn.Buffer).")
             else:
-                print("[OK] mmgp.offload had torch.nn.Buffer string but no changes were needed.")
+                print("✅ mmgp.offload had torch.nn.Buffer string but no change needed.")
         else:
-            print("[OK] torch.nn.Buffer not found in mmgp.offload, no patch required.")
+            print("✅ torch.nn.Buffer not found in mmgp.offload, no patch necessary.")
     except Exception as e:
-        print(f"[WARNING] mmgp offload patch failed: {e}")
+        print(f"⚠️ mmgp offload patch failed: {e}")
+
 
 def runtime_patch_mmgp_bridge():
-    """Fix ZeroGPU / CPU-only startup by mocking fp8_quanto_bridge if absent"""
+    """Inject a dummy fp8_quanto_bridge so mmgp doesn't crash on CPU/ZeroGPU."""
     try:
         import mmgp
+
         if hasattr(mmgp, "fp8_quanto_bridge"):
-            print("[OK] mmgp.fp8_quanto_bridge already present.")
+            print("✅ mmgp.fp8_quanto_bridge already present.")
             return
 
         class _DummyBridge:
             def __getattr__(self, _):
                 return self
-            def __call__(self, *a, **k):
+
+            def __call__(self, *args, **kwargs):
                 return self
+
             def __bool__(self):
                 return False
-            # Add the missing functions that mmgp.offload.py tries to import
-            def convert_scaled_fp8_to_quanto(self, *args, **kwargs):
-                return None
-            def detect_safetensors_format(self, *args, **kwargs):
-                return None
 
         dummy = _DummyBridge()
         mmgp.fp8_quanto_bridge = dummy
@@ -58,45 +62,42 @@ def runtime_patch_mmgp_bridge():
         fake_mod = types.ModuleType("mmgp.fp8_quanto_bridge")
         fake_mod.load_quantized_model = dummy
         fake_mod.enable_fp8_marlin_fallback = dummy
-        fake_mod.convert_scaled_fp8_to_quanto = dummy.convert_scaled_fp8_to_quanto
-        fake_mod.detect_safetensors_format = dummy.detect_safetensors_format
         sys.modules["mmgp.fp8_quanto_bridge"] = fake_mod
 
-        print("[OK] Injected dummy mmgp.fp8_quanto_bridge.")
+        print("✅ Injected dummy mmgp.fp8_quanto_bridge.")
     except Exception as e:
-        print(f"[WARNING] Runtime mmgp bridge patch failed: {e}")
+        print(f"⚠️ Runtime mmgp bridge patch failed: {e}")
+
 
 def patch_spaces_zero_pickling():
-    """Patch spaces.zero.wrappers to avoid pickling GradioPartialContext"""
+    """Patch spaces.zero.wrappers to avoid pickling GradioPartialContext (thread.lock)."""
     try:
         import spaces.zero.wrappers as wrappers
+
         wrappers_path = pathlib.Path(wrappers.__file__)
         text = wrappers_path.read_text()
-
-        # Original line typically:
-        # worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))
-        pattern = "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))"
-
-        if pattern in text:
-            text_new = text.replace(
+        target = "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))"
+        if target in text:
+            new_text = text.replace(
                 "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))",
                 "worker.arg_queue.put(((args, kwargs), None))",
             )
-            if text_new != text:
-                wrappers_path.write_text(text_new)
-                print("[OK] Patched spaces.zero.wrappers to avoid pickling GradioPartialContext.")
+            if new_text != text:
+                wrappers_path.write_text(new_text)
+                print("✅ Patched spaces.zero.wrappers to avoid pickling GradioPartialContext.")
             else:
-                print("[OK] spaces.zero.wrappers pattern unchanged (no diff).")
+                print("✅ spaces.zero.wrappers pattern unchanged (no diff).")
         else:
-            print("[OK] spaces.zero.wrappers already patched or pattern not found.")
+            print("✅ spaces.zero.wrappers already patched or pattern not found.")
     except Exception as e:
-        print(f"[WARNING] spaces.zero.wrappers patch failed: {e}")
+        print(f"⚠️ spaces.zero.wrappers patch failed: {e}")
+
 
 def patch_gradio_slider_clamp():
-    """Patch Gradio Slider to clamp values to min/max before validation"""
+    """Extra safety: clamp slider values to [min,max] before preprocess."""
     try:
-        import gradio as gr
         from gradio.components import Slider
+
         orig = Slider.preprocess
 
         def clamped(self, x):
@@ -114,28 +115,38 @@ def patch_gradio_slider_clamp():
             return orig(self, x)
 
         Slider.preprocess = clamped
-        print("[OK] Runtime slider clamp patch applied.")
+        print("✅ Runtime slider clamp patch applied.")
     except Exception as e:
-        print(f"[WARNING] Runtime slider clamp patch failed: {e}")
+        print(f"⚠️ Runtime slider clamp patch failed: {e}")
 
-def main():
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
-    if repo_dir not in sys.path:
-        sys.path.insert(0, repo_dir)
 
-    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+# ---- Apply patches BEFORE importing wgp ----
 
-    # Apply runtime patches BEFORE importing wgp.py
-    patch_mmgp_offload()
-    runtime_patch_mmgp_bridge()
-    patch_spaces_zero_pickling()
-    patch_gradio_slider_clamp()
+patch_mmgp_offload()
+runtime_patch_mmgp_bridge()
+patch_spaces_zero_pickling()
+patch_gradio_slider_clamp()
 
-    # Prepare to run Wan2GP in i2v mode
-    sys.argv = ["wgp.py", "--i2v"]
-    print("[INFO] Wan2GP ready to launch: python wgp.py --i2v via app.main()")
-    # NOTE: Do NOT call runpy.run_path() here in this editing step.
-    # The host environment will invoke main() when appropriate.
+# Make wgp think it's running in --i2v mode
+sys.argv = ["wgp.py", "--i2v"]
+
+import wgp  # noqa: E402
+
+# Hugging Face Gradio Spaces expect a top-level `demo` Blocks object
+try:
+    demo = wgp.create_ui()
+    print("✅ Built Gradio Blocks via wgp.create_ui().")
+except AttributeError:
+    # Fallback: some versions expose the Blocks as `main`
+    try:
+        demo = wgp.main
+        print("✅ Using wgp.main as Gradio Blocks.")
+    except AttributeError as e:
+        raise RuntimeError(
+            "Could not find a Gradio Blocks object (create_ui or main) in wgp.py"
+        ) from e
+
 
 if __name__ == "__main__":
-    main()
+    # Local testing: run the app directly
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860)
