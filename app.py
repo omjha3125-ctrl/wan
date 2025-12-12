@@ -9,18 +9,13 @@ import importlib
 import multiprocessing as mp
 from pathlib import Path
 
-# ------------------------------------------------------------
-# 0) Force spawn early
-# ------------------------------------------------------------
 try:
     mp.set_start_method("spawn", force=True)
     print("✅ multiprocessing start method set to spawn (forced)")
 except RuntimeError:
     pass
 
-# ------------------------------------------------------------
-# 0.1) Cloudpickle-compatible ForkingPickler (spawn needs this)
-# ------------------------------------------------------------
+
 def patch_multiprocessing_cloudpickle():
     import pickle
     import cloudpickle
@@ -39,7 +34,6 @@ def patch_multiprocessing_cloudpickle():
 
     reduction.ForkingPickler = CloudForkingPickler
 
-    # Patch cached references used by Queue feeder thread
     try:
         import multiprocessing.queues as mpq
         mpq._ForkingPickler = CloudForkingPickler
@@ -58,17 +52,10 @@ def patch_multiprocessing_cloudpickle():
 
 patch_multiprocessing_cloudpickle()
 
-# ------------------------------------------------------------
-# 1) Import spaces early (ZeroGPU requirement)
-# ------------------------------------------------------------
 import spaces  # noqa: F401
 
 
 def patch_spaces_zero_wrappers_on_disk():
-    """
-    Best-effort: if wrappers hardcodes fork, replace with spawn.
-    Do NOT touch wrappers.Queue (it's custom and has wlock_release()).
-    """
     try:
         import spaces.zero.wrappers as wrappers
 
@@ -102,31 +89,19 @@ def patch_spaces_zero_wrappers_on_disk():
 
 
 def patch_spaces_zero_wrappers_runtime():
-    """
-    Force spawn ONLY for wrappers.Process.
-    Do NOT override wrappers.Queue/SimpleQueue (custom features needed).
-    Also avoid pickling GradioPartialContext.
-    """
     try:
         import spaces.zero.wrappers as wrappers
-
         ctx = mp.get_context("spawn")
-
         if hasattr(wrappers, "Process"):
             wrappers.Process = ctx.Process
-
         if hasattr(wrappers, "GradioPartialContext") and hasattr(wrappers.GradioPartialContext, "get"):
             wrappers.GradioPartialContext.get = staticmethod(lambda: None)
-
         print("✅ Patched spaces.zero.wrappers runtime (spawn Process + no GradioPartialContext pickling).")
     except Exception as e:
         print(f"⚠️ patch_spaces_zero_wrappers_runtime failed: {e}")
 
 
 def preload_mmgp_fp8_bridge_stubs():
-    """
-    Ensure mmgp.offload import doesn't crash on fp8_quanto_bridge missing symbols.
-    """
     modname = "mmgp.fp8_quanto_bridge"
     bridge = sys.modules.get(modname)
     if bridge is None:
@@ -154,12 +129,8 @@ def preload_mmgp_fp8_bridge_stubs():
 
 
 def patch_mmgp_offload():
-    """
-    Remove torch.nn.Buffer(...) wrapper if present in installed mmgp/offload.py
-    """
     try:
         import mmgp  # noqa: F401
-
         offload_path = pathlib.Path(mmgp.__file__).with_name("offload.py")
         if not offload_path.exists():
             print("⚠️ mmgp offload.py not found, skipping.")
@@ -180,12 +151,8 @@ def patch_mmgp_offload():
 
 
 def patch_gradio_slider_clamp():
-    """
-    Prevent Gradio slider crash: Value 0 < min 1.0
-    """
     try:
         from gradio.components import Slider
-
         orig = Slider.preprocess
 
         def clamped(self, x):
@@ -209,15 +176,10 @@ def patch_gradio_slider_clamp():
 
 
 def ensure_wgp_plugin_app(wgp_module):
-    """
-    wgp.create_ui expects global `app` with plugin methods.
-    """
     if getattr(wgp_module, "app", None) is not None:
         print("[Plugin] wgp.app already present.")
         return
-
     from shared.utils.plugins import WAN2GPApplication
-
     wgp_module.app = WAN2GPApplication()
     print("✅ [Plugin] WAN2GPApplication injected by app.py.")
 
@@ -232,29 +194,19 @@ def main():
     patch_mmgp_offload()
     patch_gradio_slider_clamp()
 
-    # Force Wan2GP i2v mode
     sys.argv = ["wgp.py", "--i2v"]
 
-    import wgp  # imported ONLY in real main process
-
+    import wgp  # noqa: E402
     ensure_wgp_plugin_app(wgp)
 
     demo = wgp.create_ui()
     print("✅ Built Gradio Blocks via wgp.create_ui().")
 
     port = int(os.getenv("PORT", "7860"))
-
-    # Keep queue conservative (helps ZeroGPU stability)
-    demo.queue(concurrency_count=1, max_size=8).launch(
-        server_name="0.0.0.0",
-        server_port=port,
-        ssr_mode=False,
-    )
+    demo.queue().launch(server_name="0.0.0.0", server_port=port, ssr_mode=False)
 
 
 if __name__ == "__main__":
-    # HARD GUARD: ZeroGPU worker spawn can execute this module "as main".
-    # If it's not the real MainProcess, DO NOT build UI / launch server.
     if mp.current_process().name != "MainProcess":
         print("⚠️ Worker process import detected; skipping main()")
     else:
