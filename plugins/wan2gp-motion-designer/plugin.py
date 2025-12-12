@@ -137,7 +137,7 @@ class MotionDesignerPlugin(WAN2GPPlugin):
 
     def on_tab_select(self, state: dict) -> str:
         model_def = self.get_model_def(state["model_type"])
-        mode = "cut_drag" 
+        mode = "cut_drag"
         if model_def.get("i2v_v2v", False):
             mode = "cut_drag"
         elif model_def.get("vace_class", False):
@@ -218,9 +218,6 @@ class MotionDesignerPlugin(WAN2GPPlugin):
         if sanitized_guide_path:
             self._log_frame_check("guide", sanitized_guide_path, guide_metadata or metadata)
 
-        # sanitized_mask_path = file_path
-        # sanitized_guide_path = guide_path
-
         ui_settings = self.get_current_model_settings(state)
         if render_mode == "classic":
             ui_settings["video_guide"] = str(sanitized_mask_path)
@@ -257,10 +254,15 @@ class MotionDesignerPlugin(WAN2GPPlugin):
                     ui_settings["image_refs"] = [background_image]
             else:
                 ui_settings["image_start"] = [background_image]
+
         if render_mode == "classic":
-            self.update_video_prompt_type(state, any_video_guide = True, any_background_image_ref = True, process_type = "")
+            self.update_video_prompt_type(
+                state, any_video_guide=True, any_background_image_ref=True, process_type=""
+            )
         else:
-            self.update_video_prompt_type(state, any_video_guide = True, any_video_mask = True, default_update="G")
+            self.update_video_prompt_type(
+                state, any_video_guide=True, any_video_mask=True, default_update="G"
+            )
 
         gr.Info("Motion Designer data transferred to the Video Generator.")
         return time.time()
@@ -283,7 +285,6 @@ class MotionDesignerPlugin(WAN2GPPlugin):
         frame_rate = max(int(fps), 1) if isinstance(fps, (int, float)) and fps else 16
         temp_path = source_path.with_suffix(".clean.webm")
         try:
-            # Stream copy while stamping a constant frame rate into the container.
             (
                 ffmpeg
                 .input(str(source_path))
@@ -334,14 +335,11 @@ class MotionDesignerPlugin(WAN2GPPlugin):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             output = (result.stdout or "").strip().splitlines()
-            # Expected output: nb_read_frames, nb_frames, avg_frame_rate, r_frame_rate (all may be present)
             frame_count = None
             fps_val = None
             for line in output:
                 if line.strip().isdigit():
-                    # First integer we see is usually nb_read_frames
-                    val = int(line.strip())
-                    frame_count = val
+                    frame_count = int(line.strip())
                 elif "/" in line:
                     num, _, denom = line.partition("/")
                     try:
@@ -376,6 +374,24 @@ class MotionDesignerPlugin(WAN2GPPlugin):
         script_path = assets_dir / "app.js"
         style_path = assets_dir / "style.css"
 
+        # If any required asset is missing, DO NOT crash the whole Space.
+        # Return a simple fallback HTML so the UI can still load.
+        if not template_path.exists() or not script_path.exists() or not style_path.exists():
+            missing = []
+            if not template_path.exists():
+                missing.append("motion_designer_iframe_template.html")
+            if not script_path.exists():
+                missing.append("app.js")
+            if not style_path.exists():
+                missing.append("style.css")
+            print(f"[MotionDesignerPlugin] Missing assets: {', '.join(missing)}. Plugin UI disabled.")
+            return (
+                "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
+                "<b>Motion Designer plugin disabled</b><br>"
+                f"Missing assets: {', '.join(missing)}"
+                "</div>"
+            )
+
         cache_signature: tuple[int, int, int] | None = None
         try:
             cache_signature = (
@@ -383,45 +399,33 @@ class MotionDesignerPlugin(WAN2GPPlugin):
                 script_path.stat().st_mtime_ns,
                 style_path.stat().st_mtime_ns,
             )
-        except FileNotFoundError:
+        except Exception:
             cache_signature = None
-        if (
-            self._iframe_html_cache
-            and cache_signature
-            and cache_signature == self._iframe_cache_signature
-        ):
+
+        if self._iframe_html_cache and cache_signature and cache_signature == self._iframe_cache_signature:
             return self._iframe_html_cache
 
-        from pathlib import Path
+        try:
+            template_html = template_path.read_text(encoding="utf-8")
+            script_js = script_path.read_text(encoding="utf-8")
+            style_css = style_path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[MotionDesignerPlugin] Failed reading assets: {e}. Plugin UI disabled.")
+            return (
+                "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
+                "<b>Motion Designer plugin disabled</b><br>"
+                "Asset read error."
+                "</div>"
+            )
 
-        def _get_iframe_markup(self):
-            template_path = Path(__file__).parent / "assets" / "motion_designer_iframe_template.html"
-            try:
-                template_html = template_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                print(f"[MotionDesigner] Missing template: {template_path}. Using fallback UI.")
-                return (
-                    "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
-                    "<b>Motion Designer plugin disabled</b><br>"
-                    "Missing asset: motion_designer_iframe_template.html"
-                    "</div>"
-                )
-            except Exception as e:
-                print(f"[MotionDesigner] Failed reading template: {e}. Using fallback UI.")
-                return (
-                    "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
-                    "<b>Motion Designer plugin disabled</b><br>"
-                    "Template read error."
-                    "</div>"
-                )
-
-           
-
-        script_js = script_path.read_text(encoding="utf-8")
-        style_css = style_path.read_text(encoding="utf-8")
-
-        iframe_html = template_html.replace("<!-- MOTION_DESIGNER_STYLE_INLINE -->", f"<style>{style_css}</style>")
-        iframe_html = iframe_html.replace("<!-- MOTION_DESIGNER_SCRIPT_INLINE -->", f"<script>{script_js}</script>")
+        iframe_html = template_html.replace(
+            "<!-- MOTION_DESIGNER_STYLE_INLINE -->",
+            f"<style>{style_css}</style>",
+        )
+        iframe_html = iframe_html.replace(
+            "<!-- MOTION_DESIGNER_SCRIPT_INLINE -->",
+            f"<script>{script_js}</script>",
+        )
 
         encoded = base64.b64encode(iframe_html.encode("utf-8")).decode("ascii")
         self._iframe_html_cache = (
