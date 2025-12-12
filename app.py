@@ -3,6 +3,14 @@ import sys
 import re
 import types
 import pathlib
+import multiprocessing as mp
+
+try:
+    mp.set_start_method("spawn", force=True)
+    print("✅ multiprocessing start method set to spawn")
+except RuntimeError:
+    # already set by environment
+    pass
 
 # IMPORTANT: import spaces BEFORE any torch/mmgp/wgp import (ZeroGPU requirement)
 import spaces  # noqa: F401
