@@ -3,65 +3,23 @@ import sys
 import re
 import types
 import pathlib
-import wgp  # noqa: E402
 
-def _ensure_wgp_plugin_app():
-    # wgp expects a global name `app` in its module namespace
-    if getattr(wgp, "app", None) is not None:
-        print("[Plugin] wgp.app already present.")
-        return
+# IMPORTANT: import spaces BEFORE any torch/mmgp/wgp import (ZeroGPU requirement)
+import spaces  # noqa: F401
 
-    try:
-        from shared.utils.plugins import WAN2GPApplication
-        wgp.app = WAN2GPApplication()
-        print("[Plugin] WAN2GPApplication injected by app.py.")
-    except Exception as e:
-        # minimal dummy so UI can still build even if plugins can't
-        class _DummyPluginApp:
-            def initialize_plugins(self, globals_dict):
-                print("[Plugin] Dummy initialize_plugins (no-op).")
-
-            def run_component_insertion(self, locals_dict):
-                print("[Plugin] Dummy run_component_insertion (no-op).")
-
-            def setup_ui_tabs(self, *args, **kwargs):
-                print("[Plugin] Dummy setup_ui_tabs (no-op).")
-
-            def get_tab_order(self):
-                return []
-
-        wgp.app = _DummyPluginApp()
-        print(f"[Plugin] Using DummyPluginApp (plugins disabled): {e}")
-
-_ensure_wgp_plugin_app()
-
-demo = wgp.create_ui()
-print("✅ Built Gradio Blocks via wgp.create_ui().")
-
-
-# Avoid audio backend issues on HF containers
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 
 # -------------------------------------------------------------------
-# 0) MUST preload mmgp.fp8_quanto_bridge stubs BEFORE importing mmgp/offload
+# 0) Preload mmgp.fp8_quanto_bridge stubs BEFORE importing mmgp/offload
 # -------------------------------------------------------------------
 def preload_mmgp_fp8_bridge_stubs():
-    """
-    mmgp.offload imports these names at import-time:
-      from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format
-    On CPU/ZeroGPU or mismatched mmgp builds, that module may not exist or may be incomplete.
-
-    This function ensures sys.modules contains mmgp.fp8_quanto_bridge with required symbols
-    BEFORE any 'import mmgp' / 'import wgp' happens.
-    """
     modname = "mmgp.fp8_quanto_bridge"
     bridge = sys.modules.get(modname)
     if bridge is None:
         bridge = types.ModuleType(modname)
         sys.modules[modname] = bridge
 
-    # Safe no-op stubs
     def convert_scaled_fp8_to_quanto(tensor, *args, **kwargs):
         return tensor
 
@@ -74,7 +32,6 @@ def preload_mmgp_fp8_bridge_stubs():
     def enable_fp8_marlin_fallback(*args, **kwargs):
         return None
 
-    # Inject/overwrite required attributes
     bridge.convert_scaled_fp8_to_quanto = convert_scaled_fp8_to_quanto
     bridge.detect_safetensors_format = detect_safetensors_format
     bridge.load_quantized_model = load_quantized_model
@@ -87,31 +44,22 @@ def preload_mmgp_fp8_bridge_stubs():
 # 1) Patch mmgp.offload to remove torch.nn.Buffer(...) if present
 # -------------------------------------------------------------------
 def patch_mmgp_offload():
-    """
-    Some mmgp versions reference torch.nn.Buffer(...) in ways that break in certain envs.
-    This patch edits the installed mmgp/offload.py in-place to remove torch.nn.Buffer wrappers.
-    """
     try:
         import mmgp  # noqa: F401
 
         offload_path = pathlib.Path(mmgp.__file__).with_name("offload.py")
         if not offload_path.exists():
-            print("⚠️ mmgp offload.py not found, skipping mmgp patch.")
+            print("⚠️ mmgp offload.py not found, skipping.")
             return
 
         text = offload_path.read_text()
         if "torch.nn.Buffer" in text:
-            new_text = re.sub(
-                r"torch\.nn\.Buffer\((.*?)\)",
-                r"\1",
-                text,
-                flags=re.DOTALL,
-            )
+            new_text = re.sub(r"torch\.nn\.Buffer\((.*?)\)", r"\1", text, flags=re.DOTALL)
             if new_text != text:
                 offload_path.write_text(new_text)
                 print("✅ Patched mmgp.offload (removed torch.nn.Buffer).")
             else:
-                print("✅ mmgp.offload contained torch.nn.Buffer but no change was needed.")
+                print("✅ mmgp.offload: torch.nn.Buffer present but no change needed.")
         else:
             print("✅ torch.nn.Buffer not found in mmgp.offload, no patch necessary.")
     except Exception as e:
@@ -122,15 +70,6 @@ def patch_mmgp_offload():
 # 2) Patch spaces.zero.wrappers pickling issue (GradioPartialContext)
 # -------------------------------------------------------------------
 def patch_spaces_zero_pickling():
-    """
-    Fix ZeroGPU crash:
-      _pickle.PicklingError: cannot pickle '_thread.lock' object
-    caused by pickling GradioPartialContext.get() into multiprocessing queue.
-
-    We patch spaces.zero.wrappers in-place:
-      worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))
-      -> worker.arg_queue.put(((args, kwargs), None))
-    """
     try:
         import spaces.zero.wrappers as wrappers  # noqa: F401
 
@@ -143,11 +82,8 @@ def patch_spaces_zero_pickling():
                 "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))",
                 "worker.arg_queue.put(((args, kwargs), None))",
             )
-            if new_text != text:
-                wrappers_path.write_text(new_text)
-                print("✅ Patched spaces.zero.wrappers to avoid pickling GradioPartialContext.")
-            else:
-                print("✅ spaces.zero.wrappers pattern unchanged (no diff).")
+            wrappers_path.write_text(new_text)
+            print("✅ Patched spaces.zero.wrappers to avoid pickling GradioPartialContext.")
         else:
             print("✅ spaces.zero.wrappers already patched or pattern not found.")
     except Exception as e:
@@ -155,12 +91,9 @@ def patch_spaces_zero_pickling():
 
 
 # -------------------------------------------------------------------
-# 3) Clamp slider preprocess to avoid "Value 0 is less than minimum value 1.0"
+# 3) Clamp Gradio slider preprocess to avoid min-bound crash
 # -------------------------------------------------------------------
 def patch_gradio_slider_clamp():
-    """
-    Gradio can error if slider sends 0 while minimum is 1. Clamp values in preprocess.
-    """
     try:
         from gradio.components import Slider
 
@@ -186,29 +119,50 @@ def patch_gradio_slider_clamp():
         print(f"⚠️ Runtime slider clamp patch failed: {e}")
 
 
-# -------------------------------------------------------------------
-# Apply patches BEFORE importing wgp (which imports mmgp.offload)
-# -------------------------------------------------------------------
+# Apply patches BEFORE importing wgp
 preload_mmgp_fp8_bridge_stubs()
 patch_mmgp_offload()
 patch_spaces_zero_pickling()
 patch_gradio_slider_clamp()
 
-# Ensure Wan2GP starts in i2v mode like you want
+# Force Wan2GP i2v mode like you want
 sys.argv = ["wgp.py", "--i2v"]
 
-# Import Wan2GP AFTER patches
 import wgp  # noqa: E402
 
-# Hugging Face expects a top-level 'demo' Blocks
-try:
-    demo = wgp.create_ui()
-    print("✅ Built Gradio Blocks via wgp.create_ui().")
-except Exception as e:
-    # If create_ui fails, bubble up with useful message
-    raise RuntimeError(f"Failed to build UI via wgp.create_ui(): {e}") from e
+
+def _ensure_wgp_plugin_app():
+    if getattr(wgp, "app", None) is not None:
+        print("[Plugin] wgp.app already present.")
+        return
+
+    try:
+        from shared.utils.plugins import WAN2GPApplication
+
+        wgp.app = WAN2GPApplication()
+        print("[Plugin] WAN2GPApplication injected by app.py.")
+    except Exception as e:
+        class _DummyPluginApp:
+            def initialize_plugins(self, globals_dict):
+                print("[Plugin] Dummy initialize_plugins (no-op).")
+
+            def run_component_insertion(self, locals_dict):
+                print("[Plugin] Dummy run_component_insertion (no-op).")
+
+            def setup_ui_tabs(self, *args, **kwargs):
+                print("[Plugin] Dummy setup_ui_tabs (no-op).")
+
+            def get_tab_order(self):
+                return []
+
+        wgp.app = _DummyPluginApp()
+        print(f"[Plugin] Using DummyPluginApp (plugins disabled): {e}")
 
 
-# Local run (HF ignores this; it imports demo)
+_ensure_wgp_plugin_app()
+
+demo = wgp.create_ui()
+print("✅ Built Gradio Blocks via wgp.create_ui().")
+
 if __name__ == "__main__":
     demo.queue().launch(server_name="0.0.0.0", server_port=7860)
