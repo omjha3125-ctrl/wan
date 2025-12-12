@@ -3,6 +3,41 @@ import sys
 import re
 import types
 import pathlib
+import wgp  # noqa: E402
+
+def _ensure_wgp_plugin_app():
+    # wgp expects a global name `app` in its module namespace
+    if getattr(wgp, "app", None) is not None:
+        print("[Plugin] wgp.app already present.")
+        return
+
+    try:
+        from shared.utils.plugins import WAN2GPApplication
+        wgp.app = WAN2GPApplication()
+        print("[Plugin] WAN2GPApplication injected by app.py.")
+    except Exception as e:
+        # minimal dummy so UI can still build even if plugins can't
+        class _DummyPluginApp:
+            def initialize_plugins(self, globals_dict):
+                print("[Plugin] Dummy initialize_plugins (no-op).")
+
+            def run_component_insertion(self, locals_dict):
+                print("[Plugin] Dummy run_component_insertion (no-op).")
+
+            def setup_ui_tabs(self, *args, **kwargs):
+                print("[Plugin] Dummy setup_ui_tabs (no-op).")
+
+            def get_tab_order(self):
+                return []
+
+        wgp.app = _DummyPluginApp()
+        print(f"[Plugin] Using DummyPluginApp (plugins disabled): {e}")
+
+_ensure_wgp_plugin_app()
+
+demo = wgp.create_ui()
+print("✅ Built Gradio Blocks via wgp.create_ui().")
+
 
 # Avoid audio backend issues on HF containers
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
