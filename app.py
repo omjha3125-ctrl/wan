@@ -9,44 +9,68 @@ import importlib
 import multiprocessing as mp
 from pathlib import Path
 
-# 0) Force spawn as early as possible
+# ------------------------------------------------------------
+# 0) Force spawn as early as possible (CUDA + multiprocessing)
+# ------------------------------------------------------------
 try:
     mp.set_start_method("spawn", force=True)
     print("✅ multiprocessing start method set to spawn (forced)")
 except RuntimeError:
     pass
 
-# 0.1) Make spawn able to pickle nested functions used by spaces.zero.wrappers
+
+# ------------------------------------------------------------
+# 0.1) Make multiprocessing able to pickle nested functions
+#      (spaces.zero.wrappers creates nested callables)
+# ------------------------------------------------------------
 def patch_multiprocessing_cloudpickle():
+    import pickle
+    import cloudpickle
+    import multiprocessing.reduction as reduction
+
+    class CloudForkingPickler(cloudpickle.CloudPickler):
+        @classmethod
+        def dumps(cls, obj, protocol=None):
+            if protocol is None:
+                protocol = pickle.HIGHEST_PROTOCOL
+            return cloudpickle.dumps(obj, protocol=protocol)
+
+        @classmethod
+        def loads(cls, buf):
+            return cloudpickle.loads(buf)
+
+    # Patch reduction (used by spawn + queues)
+    reduction.ForkingPickler = CloudForkingPickler
+
+    # Some modules cache _ForkingPickler at import time; patch them too
     try:
-        import cloudpickle  # <-- add to requirements.txt
-        import multiprocessing.reduction as reduction
+        import multiprocessing.queues as mpq
+        mpq._ForkingPickler = CloudForkingPickler
+    except Exception:
+        pass
 
-        # Make multiprocessing use cloudpickle for spawn payloads
-        reduction.ForkingPickler = cloudpickle.CloudPickler  # type: ignore[attr-defined]
+    try:
+        import multiprocessing.connection as mpc
+        if hasattr(mpc, "_ForkingPickler"):
+            mpc._ForkingPickler = CloudForkingPickler
+    except Exception:
+        pass
 
-        def _cloud_dump(obj, file, protocol=None):
-            cloudpickle.dump(obj, file, protocol=protocol)
-
-        reduction.dump = _cloud_dump  # type: ignore[assignment]
-
-        print("✅ Patched multiprocessing pickler to cloudpickle (spawn can pickle nested functions).")
-    except Exception as e:
-        raise RuntimeError(
-            "cloudpickle is required to run ZeroGPU with spawn here. "
-            "Add `cloudpickle` to requirements.txt and rebuild."
-        ) from e
+    print("✅ Patched multiprocessing pickler to cloudpickle (spawn can pickle nested functions).")
 
 
 patch_multiprocessing_cloudpickle()
 
-# 1) Import spaces BEFORE torch/mmgp/wgp (ZeroGPU requirement)
+# ------------------------------------------------------------
+# 1) Import spaces BEFORE anything that might touch CUDA/torch
+# ------------------------------------------------------------
 import spaces  # noqa: F401
 
 
 def patch_spaces_zero_wrappers_on_disk():
     """
-    Replace fork->spawn and avoid GradioPartialContext pickling (if patterns match).
+    Replace fork->spawn in spaces.zero.wrappers and avoid GradioPartialContext pickling
+    if the exact patterns exist.
     """
     try:
         import spaces.zero.wrappers as wrappers
@@ -224,7 +248,7 @@ def ensure_wgp_plugin_app(wgp_module):
 # ---- Startup order ----
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-# Patch spaces wrappers BEFORE importing wgp (and before GPU job runs)
+# Patch spaces wrappers before importing wgp / before any GPU call
 patch_spaces_zero_wrappers_on_disk()
 patch_spaces_zero_wrappers_runtime()
 
@@ -238,7 +262,7 @@ patch_gradio_slider_clamp()
 # Force Wan2GP i2v mode
 sys.argv = ["wgp.py", "--i2v"]
 
-# Import wgp only after the above
+# Import wgp only after all the above
 import wgp  # noqa: E402
 
 ensure_wgp_plugin_app(wgp)
