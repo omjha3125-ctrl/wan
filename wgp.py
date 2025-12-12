@@ -97,32 +97,37 @@ import requests
 from shared.gradio.gallery import AdvancedMediaGallery
 from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
-# Ensure a plugin app instance exists when running as an imported module (e.g. on Hugging Face Spaces)
-try:
-    app  # type: ignore[name-defined]
-except NameError:
-    try:
-        app = WAN2GPApplication()
-        print("[Plugin] WAN2GPApplication created for imported context.")
-    except Exception as _e:
-        # Fallback dummy app: disable plugin features but keep the UI working
-        class _DummyPluginApp:
-            def initialize_plugins(self, globals_dict):
-                print("[Plugin] Dummy initialize_plugins (no-op).")
-
-            def run_component_insertion(self, locals_dict):
-                print("[Plugin] Dummy run_component_insertion (no-op).")
-
-            def setup_ui_tabs(self, *args, **kwargs):
-                print("[Plugin] Dummy setup_ui_tabs (no-op).")
-
-            def get_tab_order(self):
-                return []
-
-        app = _DummyPluginApp()
-        print(f"[Plugin] Using DummyPluginApp due to error: {_e}")
-
 from collections import defaultdict
+import os as _os
+
+try:
+    import spaces as _spaces  # type: ignore
+except Exception:
+    _spaces = None  # type: ignore
+
+_WAN2GP_IN_HF_SPACE = bool(_os.getenv("SPACE_ID") or _os.getenv("HF_SPACE_ID") or _os.getenv("SPACE_REPO_NAME"))
+
+if _spaces is not None:
+    @_spaces.GPU(duration=600)
+    def _zg_generate_video(params: dict):
+        """
+        ZeroGPU worker args must be picklable.
+        task/send_cmd/plugin_data contain thread locks -> cannot be pickled.
+        """
+        class _NoOp:
+            cancelled = False
+            stopped = False
+
+            def __getattr__(self, _):
+                return lambda *a, **k: None
+
+            def __bool__(self):
+                return False
+
+        return generate_video(_NoOp(), _NoOp(), plugin_data=None, **params)
+else:
+    def _zg_generate_video(params: dict):
+        raise RuntimeError("spaces not available; cannot run ZeroGPU wrapper")
 
 # import torch._dynamo as dynamo
 # dynamo.config.recompile_limit = 2000   # default is 256
@@ -4931,7 +4936,7 @@ def custom_preprocess_video_with_mask(model_handler, base_model_type, pre_video_
 
     return video_guide_processed, video_guide_processed2, video_mask_processed, video_mask_processed2 
 
-@spaces.GPU(duration=600)
+
 def generate_video(
     task,
     send_cmd,
@@ -6068,6 +6073,44 @@ def generate_video(
 
     remove_temp_filenames(temp_filenames_list)
 
+import os
+
+try:
+    import spaces  # type: ignore
+except Exception:
+    spaces = None  # type: ignore
+
+_WAN2GP_ON_HF = bool(os.getenv("SPACE_ID") or os.getenv("HF_SPACE_ID") or os.getenv("SPACE_REPO_NAME"))
+_WAN2GP_ON_ZEROGPU = _WAN2GP_ON_HF and (spaces is not None)
+
+
+if spaces is not None:
+    @spaces.GPU(duration=600)
+    def _zg_generate_video(params: dict):
+        """
+        ZeroGPU worker must receive picklable args only.
+        task/send_cmd/plugin_data contain thread locks -> NOT picklable.
+        So we create cheap no-op objects inside the worker.
+        """
+        class _NoOp:
+            cancelled = False
+            stopped = False
+
+            def __getattr__(self, _):
+                return lambda *a, **k: None
+
+            def __bool__(self):
+                return False
+
+        task = _NoOp()
+        send_cmd = _NoOp()
+
+        # plugin_data is often non-picklable; disable it here to keep ZeroGPU stable
+        return generate_video(task, send_cmd, plugin_data=None, **params)
+else:
+    def _zg_generate_video(params: dict):
+        raise RuntimeError("spaces package not available; cannot run ZeroGPU wrapper")
+
 def prepare_generate_video(state):    
 
     if state.get("validate_success",0) != 1:
@@ -6245,7 +6288,11 @@ def process_tasks(state):
                         if arg_name not in params and arg_name in default_settings:
                             params[arg_name] = default_settings[arg_name]
                 plugin_data = task.pop('plugin_data', {})
-                generate_video(task, send_cmd, plugin_data=plugin_data,  **params)
+                if _WAN2GP_ON_ZEROGPU:
+                    return _zg_generate_video(params)
+
+                return generate_video(task, send_cmd, plugin_data=plugin_data, **params)
+
             except Exception as e:
                 tb = traceback.format_exc().split('\n')[:-1] 
                 print('\n'.join(tb))
@@ -6367,7 +6414,10 @@ def process_tasks_cli(queue, state):
                     expected_args = set(inspect.signature(generate_video).parameters.keys())
                     filtered_params = {k: v for k, v in params.items() if k in expected_args}
                     plugin_data = task.get('plugin_data', {})
-                    generate_video(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+                    if _WAN2GP_IN_HF_SPACE and _spaces is not None:
+                        return _zg_generate_video(filtered_params)
+                    return generate_video(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+
                 except Exception as e:
                     print(f"\n  [ERROR] {e}")
                     traceback.print_exc()
