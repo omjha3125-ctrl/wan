@@ -7,6 +7,40 @@ import pathlib
 # Avoid audio backend issues
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+def ensure_fp8_quanto_bridge_module():
+    """
+    Create mmgp.fp8_quanto_bridge in sys.modules with the symbols mmgp.offload imports.
+    Must run BEFORE importing wgp (which imports mmgp.offload).
+    """
+    modname = "mmgp.fp8_quanto_bridge"
+
+    bridge = sys.modules.get(modname)
+    if bridge is None:
+        bridge = types.ModuleType(modname)
+        sys.modules[modname] = bridge
+
+    def _noop(*args, **kwargs):
+        return None
+
+    def _convert_scaled_fp8_to_quanto(tensor, *args, **kwargs):
+        # Safe no-op: return tensor unchanged
+        return tensor
+
+    def _detect_safetensors_format(*args, **kwargs):
+        return None
+
+    required = {
+        "load_quantized_model": _noop,
+        "enable_fp8_marlin_fallback": _noop,
+        "convert_scaled_fp8_to_quanto": _convert_scaled_fp8_to_quanto,
+        "detect_safetensors_format": _detect_safetensors_format,
+    }
+
+    for name, fn in required.items():
+        if not hasattr(bridge, name):
+            setattr(bridge, name, fn)
+
+    print("✅ Preloaded mmgp.fp8_quanto_bridge stubs (ZeroGPU safe).")
 
 def patch_mmgp_offload():
     """Patch mmgp.offload to remove torch.nn.Buffer(...) which breaks on some envs."""
