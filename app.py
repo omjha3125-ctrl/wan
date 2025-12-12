@@ -10,7 +10,7 @@ import multiprocessing as mp
 from pathlib import Path
 
 # ------------------------------------------------------------
-# 0) Force spawn as early as possible (CUDA + multiprocessing)
+# 0) Force spawn early
 # ------------------------------------------------------------
 try:
     mp.set_start_method("spawn", force=True)
@@ -18,10 +18,8 @@ try:
 except RuntimeError:
     pass
 
-
 # ------------------------------------------------------------
-# 0.1) Make multiprocessing able to pickle nested functions
-#      (spaces.zero.wrappers uses nested callables)
+# 0.1) Cloudpickle-compatible ForkingPickler (spawn needs this)
 # ------------------------------------------------------------
 def patch_multiprocessing_cloudpickle():
     import pickle
@@ -41,7 +39,7 @@ def patch_multiprocessing_cloudpickle():
 
     reduction.ForkingPickler = CloudForkingPickler
 
-    # patch common cached references
+    # Patch cached references used by Queue feeder thread
     try:
         import multiprocessing.queues as mpq
         mpq._ForkingPickler = CloudForkingPickler
@@ -61,7 +59,7 @@ def patch_multiprocessing_cloudpickle():
 patch_multiprocessing_cloudpickle()
 
 # ------------------------------------------------------------
-# 1) Import spaces BEFORE anything that might touch CUDA/torch
+# 1) Import spaces early (ZeroGPU requirement)
 # ------------------------------------------------------------
 import spaces  # noqa: F401
 
@@ -69,6 +67,7 @@ import spaces  # noqa: F401
 def patch_spaces_zero_wrappers_on_disk():
     """
     Best-effort: if wrappers hardcodes fork, replace with spawn.
+    Do NOT touch wrappers.Queue (it's custom and has wlock_release()).
     """
     try:
         import spaces.zero.wrappers as wrappers
@@ -85,7 +84,6 @@ def patch_spaces_zero_wrappers_on_disk():
                 txt = txt.replace(old, new)
                 changed = True
 
-        # older pickling fix (harmless if not present)
         old_pick = "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))"
         new_pick = "worker.arg_queue.put(((args, kwargs), None))"
         if old_pick in txt:
@@ -105,40 +103,20 @@ def patch_spaces_zero_wrappers_on_disk():
 
 def patch_spaces_zero_wrappers_runtime():
     """
-    CRITICAL:
-    - Force spawn ONLY for the worker Process.
-    - DO NOT replace wrappers.Queue (they use a custom Queue with wlock_release()).
-    - Avoid pickling GradioPartialContext.
+    Force spawn ONLY for wrappers.Process.
+    Do NOT override wrappers.Queue/SimpleQueue (custom features needed).
+    Also avoid pickling GradioPartialContext.
     """
     try:
         import spaces.zero.wrappers as wrappers
 
         ctx = mp.get_context("spawn")
 
-        # Force spawn process class
         if hasattr(wrappers, "Process"):
             wrappers.Process = ctx.Process
 
-        # DO NOT override wrappers.Queue / wrappers.SimpleQueue
-        # (Your previous patch did that and broke wlock_release)
-
-        # Avoid pickling GradioPartialContext
         if hasattr(wrappers, "GradioPartialContext") and hasattr(wrappers.GradioPartialContext, "get"):
             wrappers.GradioPartialContext.get = staticmethod(lambda: None)
-
-        # Extra safety: swallow close thread errors if any queue impl changes
-        if hasattr(wrappers, "Worker") and hasattr(wrappers.Worker, "_close_on_exit"):
-            orig_close = wrappers.Worker._close_on_exit
-
-            def _close_on_exit_safe(self):
-                try:
-                    return orig_close(self)
-                except AttributeError as e:
-                    print(f"⚠️ ZeroGPU close thread ignored AttributeError: {e}")
-                except Exception as e:
-                    print(f"⚠️ ZeroGPU close thread ignored error: {e}")
-
-            wrappers.Worker._close_on_exit = _close_on_exit_safe
 
         print("✅ Patched spaces.zero.wrappers runtime (spawn Process + no GradioPartialContext pickling).")
     except Exception as e:
@@ -238,50 +216,46 @@ def ensure_wgp_plugin_app(wgp_module):
         print("[Plugin] wgp.app already present.")
         return
 
-    try:
-        from shared.utils.plugins import WAN2GPApplication
+    from shared.utils.plugins import WAN2GPApplication
 
-        wgp_module.app = WAN2GPApplication()
-        print("[Plugin] WAN2GPApplication injected by app.py.")
-    except Exception as e:
-        class _DummyPluginApp:
-            def initialize_plugins(self, globals_dict):
-                print("[Plugin] Dummy initialize_plugins (no-op).")
-
-            def run_component_insertion(self, locals_dict):
-                print("[Plugin] Dummy run_component_insertion (no-op).")
-
-            def setup_ui_tabs(self, *args, **kwargs):
-                print("[Plugin] Dummy setup_ui_tabs (no-op).")
-
-            def get_tab_order(self):
-                return []
-
-        wgp_module.app = _DummyPluginApp()
-        print(f"[Plugin] Using DummyPluginApp (plugins disabled): {e}")
+    wgp_module.app = WAN2GPApplication()
+    print("✅ [Plugin] WAN2GPApplication injected by app.py.")
 
 
-# ---- Startup order ----
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+def main():
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-patch_spaces_zero_wrappers_on_disk()
-patch_spaces_zero_wrappers_runtime()
+    patch_spaces_zero_wrappers_on_disk()
+    patch_spaces_zero_wrappers_runtime()
 
-preload_mmgp_fp8_bridge_stubs()
-patch_mmgp_offload()
+    preload_mmgp_fp8_bridge_stubs()
+    patch_mmgp_offload()
+    patch_gradio_slider_clamp()
 
-patch_gradio_slider_clamp()
+    # Force Wan2GP i2v mode
+    sys.argv = ["wgp.py", "--i2v"]
 
-# Force Wan2GP i2v mode
-sys.argv = ["wgp.py", "--i2v"]
+    import wgp  # imported ONLY in real main process
 
-# Import wgp only after all the above
-import wgp  # noqa: E402
+    ensure_wgp_plugin_app(wgp)
 
-ensure_wgp_plugin_app(wgp)
+    demo = wgp.create_ui()
+    print("✅ Built Gradio Blocks via wgp.create_ui().")
 
-demo = wgp.create_ui()
-print("✅ Built Gradio Blocks via wgp.create_ui().")
+    port = int(os.getenv("PORT", "7860"))
+
+    # Keep queue conservative (helps ZeroGPU stability)
+    demo.queue(concurrency_count=1, max_size=8).launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        ssr_mode=False,
+    )
+
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
+    # HARD GUARD: ZeroGPU worker spawn can execute this module "as main".
+    # If it's not the real MainProcess, DO NOT build UI / launch server.
+    if mp.current_process().name != "MainProcess":
+        print("⚠️ Worker process import detected; skipping main()")
+    else:
+        main()
