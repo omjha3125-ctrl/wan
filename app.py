@@ -1,6 +1,13 @@
-# app.py — ZeroGPU-safe bootstrap for Wan2GP (Python 3.10 compatible)
+# app.py — ZeroGPU-safe bootstrap for Wan2GP (Python 3.10)
 
+import os
+import sys
+import re
+import types
+import pathlib
+import importlib
 import multiprocessing as mp
+from pathlib import Path
 
 # 0) Force spawn as early as possible
 try:
@@ -9,51 +16,37 @@ try:
 except RuntimeError:
     pass
 
-# 1) Import spaces BEFORE anything that might touch CUDA/torch
-import spaces  # noqa: F401
-
-import os
-import sys
-import re
-import types
-import pathlib
-import importlib
-from pathlib import Path
-
-
-def patch_spaces_zero_wrappers_runtime():
-    """
-    Make sure spaces ZeroGPU worker uses spawn context and doesn't try to pickle GradioPartialContext.
-    (We avoid editing multiprocessing internals; we patch spaces wrappers directly.)
-    """
+# 0.1) Make spawn able to pickle nested functions used by spaces.zero.wrappers
+def patch_multiprocessing_cloudpickle():
     try:
-        import spaces.zero.wrappers as wrappers
+        import cloudpickle  # <-- add to requirements.txt
+        import multiprocessing.reduction as reduction
 
-        ctx = mp.get_context("spawn")
+        # Make multiprocessing use cloudpickle for spawn payloads
+        reduction.ForkingPickler = cloudpickle.CloudPickler  # type: ignore[attr-defined]
 
-        # Override process/queues used by wrappers if present
-        for attr in ("Process", "Queue", "SimpleQueue"):
-            if hasattr(wrappers, attr):
-                setattr(wrappers, attr, getattr(ctx, attr))
+        def _cloud_dump(obj, file, protocol=None):
+            cloudpickle.dump(obj, file, protocol=protocol)
 
-        # If wrappers caches a context object, replace it
-        for attr in ("ctx", "mp_ctx", "_mp_ctx", "MP_CTX"):
-            if hasattr(wrappers, attr):
-                setattr(wrappers, attr, ctx)
+        reduction.dump = _cloud_dump  # type: ignore[assignment]
 
-        # Avoid pickling GradioPartialContext by making .get() return None
-        if hasattr(wrappers, "GradioPartialContext") and hasattr(wrappers.GradioPartialContext, "get"):
-            wrappers.GradioPartialContext.get = staticmethod(lambda: None)
-
-        print("✅ Patched spaces.zero.wrappers runtime (spawn + no GradioPartialContext pickling).")
+        print("✅ Patched multiprocessing pickler to cloudpickle (spawn can pickle nested functions).")
     except Exception as e:
-        print(f"⚠️ patch_spaces_zero_wrappers_runtime failed: {e}")
+        raise RuntimeError(
+            "cloudpickle is required to run ZeroGPU with spawn here. "
+            "Add `cloudpickle` to requirements.txt and rebuild."
+        ) from e
+
+
+patch_multiprocessing_cloudpickle()
+
+# 1) Import spaces BEFORE torch/mmgp/wgp (ZeroGPU requirement)
+import spaces  # noqa: F401
 
 
 def patch_spaces_zero_wrappers_on_disk():
     """
-    Best-effort patch: if wrappers hardcodes fork via get_context('fork'), replace with spawn.
-    Also keep the pickling fix if the exact line exists.
+    Replace fork->spawn and avoid GradioPartialContext pickling (if patterns match).
     """
     try:
         import spaces.zero.wrappers as wrappers
@@ -87,9 +80,34 @@ def patch_spaces_zero_wrappers_on_disk():
         print(f"⚠️ patch_spaces_zero_wrappers_on_disk failed: {e}")
 
 
+def patch_spaces_zero_wrappers_runtime():
+    """
+    Force wrappers to use spawn context and avoid pickling GradioPartialContext at runtime.
+    """
+    try:
+        import spaces.zero.wrappers as wrappers
+
+        ctx = mp.get_context("spawn")
+
+        for attr in ("Process", "Queue", "SimpleQueue"):
+            if hasattr(wrappers, attr):
+                setattr(wrappers, attr, getattr(ctx, attr))
+
+        for attr in ("ctx", "mp_ctx", "_mp_ctx", "MP_CTX"):
+            if hasattr(wrappers, attr):
+                setattr(wrappers, attr, ctx)
+
+        if hasattr(wrappers, "GradioPartialContext") and hasattr(wrappers.GradioPartialContext, "get"):
+            wrappers.GradioPartialContext.get = staticmethod(lambda: None)
+
+        print("✅ Patched spaces.zero.wrappers runtime (spawn + no GradioPartialContext pickling).")
+    except Exception as e:
+        print(f"⚠️ patch_spaces_zero_wrappers_runtime failed: {e}")
+
+
 def preload_mmgp_fp8_bridge_stubs():
     """
-    mmgp.offload imports these at import time; ensure they exist before importing mmgp/offload.
+    Ensure mmgp.offload import doesn't crash on fp8_quanto_bridge missing symbols.
     """
     modname = "mmgp.fp8_quanto_bridge"
     bridge = sys.modules.get(modname)
