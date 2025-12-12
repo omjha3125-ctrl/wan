@@ -392,7 +392,31 @@ class MotionDesignerPlugin(WAN2GPPlugin):
         ):
             return self._iframe_html_cache
 
-        template_html = template_path.read_text(encoding="utf-8")
+        from pathlib import Path
+
+        def _get_iframe_markup(self):
+            template_path = Path(__file__).parent / "assets" / "motion_designer_iframe_template.html"
+            try:
+                template_html = template_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                print(f"[MotionDesigner] Missing template: {template_path}. Using fallback UI.")
+                return (
+                    "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
+                    "<b>Motion Designer plugin disabled</b><br>"
+                    "Missing asset: motion_designer_iframe_template.html"
+                    "</div>"
+                )
+            except Exception as e:
+                print(f"[MotionDesigner] Failed reading template: {e}. Using fallback UI.")
+                return (
+                    "<div style='padding:12px;border:1px solid #444;border-radius:8px;'>"
+                    "<b>Motion Designer plugin disabled</b><br>"
+                    "Template read error."
+                    "</div>"
+                )
+
+           
+
         script_js = script_path.read_text(encoding="utf-8")
         style_css = style_path.read_text(encoding="utf-8")
 
