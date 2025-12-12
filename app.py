@@ -1,35 +1,15 @@
-# app.py
-# ZeroGPU-safe bootstrap for Wan2GP
+# app.py — ZeroGPU-safe bootstrap for Wan2GP (Python 3.10 compatible)
 
 import multiprocessing as mp
-import multiprocessing.context as mp_context
 
-# ----------------------------
-# 0) HARD-FORCE spawn (EARLY)
-# ----------------------------
-# Patch get_context so even if some library asks for "fork", it gets "spawn".
-_orig_get_context = mp_context.get_context
-
-
-def _patched_get_context(method=None):
-    if method == "fork":
-        method = "spawn"
-    return _orig_get_context(method)
-
-
-mp_context.get_context = _patched_get_context
-mp.get_context = _patched_get_context
-
+# 0) Force spawn as early as possible
 try:
     mp.set_start_method("spawn", force=True)
     print("✅ multiprocessing start method set to spawn (forced)")
 except RuntimeError:
-    # Already set by environment
     pass
 
-# ----------------------------
-# 1) Import spaces BEFORE CUDA/torch touches anything
-# ----------------------------
+# 1) Import spaces BEFORE anything that might touch CUDA/torch
 import spaces  # noqa: F401
 
 import os
@@ -38,39 +18,79 @@ import re
 import types
 import pathlib
 import importlib
+from pathlib import Path
 
 
-def patch_spaces_runtime():
+def patch_spaces_zero_wrappers_runtime():
     """
-    Ensure spaces zero worker uses spawn and avoid pickling GradioPartialContext.
-    (Even if wrappers imported `get_context` directly, we replace it here too.)
+    Make sure spaces ZeroGPU worker uses spawn context and doesn't try to pickle GradioPartialContext.
+    (We avoid editing multiprocessing internals; we patch spaces wrappers directly.)
     """
     try:
         import spaces.zero.wrappers as wrappers
 
-        # Force wrappers-level get_context to our patched one
-        if hasattr(wrappers, "get_context"):
-            wrappers.get_context = _patched_get_context
+        ctx = mp.get_context("spawn")
 
-        # Avoid pickling GradioPartialContext (safe default)
+        # Override process/queues used by wrappers if present
+        for attr in ("Process", "Queue", "SimpleQueue"):
+            if hasattr(wrappers, attr):
+                setattr(wrappers, attr, getattr(ctx, attr))
+
+        # If wrappers caches a context object, replace it
+        for attr in ("ctx", "mp_ctx", "_mp_ctx", "MP_CTX"):
+            if hasattr(wrappers, attr):
+                setattr(wrappers, attr, ctx)
+
+        # Avoid pickling GradioPartialContext by making .get() return None
         if hasattr(wrappers, "GradioPartialContext") and hasattr(wrappers.GradioPartialContext, "get"):
             wrappers.GradioPartialContext.get = staticmethod(lambda: None)
 
-        # In case wrappers cached a ctx/Process/Queue already, override them
-        ctx = mp.get_context("spawn")
-        for name in ("Process", "Queue", "SimpleQueue"):
-            if hasattr(wrappers, name):
-                setattr(wrappers, name, getattr(ctx, name))
-
-        print("✅ Patched spaces runtime (spawn + no GradioPartialContext pickling).")
+        print("✅ Patched spaces.zero.wrappers runtime (spawn + no GradioPartialContext pickling).")
     except Exception as e:
-        print(f"⚠️ patch_spaces_runtime failed: {e}")
+        print(f"⚠️ patch_spaces_zero_wrappers_runtime failed: {e}")
 
 
-# ----------------------------
-# 2) mmgp bridge stubs (must exist BEFORE mmgp.offload import)
-# ----------------------------
+def patch_spaces_zero_wrappers_on_disk():
+    """
+    Best-effort patch: if wrappers hardcodes fork via get_context('fork'), replace with spawn.
+    Also keep the pickling fix if the exact line exists.
+    """
+    try:
+        import spaces.zero.wrappers as wrappers
+
+        p = Path(wrappers.__file__)
+        txt = p.read_text(encoding="utf-8")
+        changed = False
+
+        for old, new in [
+            ("get_context('fork')", "get_context('spawn')"),
+            ('get_context("fork")', 'get_context("spawn")'),
+        ]:
+            if old in txt:
+                txt = txt.replace(old, new)
+                changed = True
+
+        old_pick = "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))"
+        new_pick = "worker.arg_queue.put(((args, kwargs), None))"
+        if old_pick in txt:
+            txt = txt.replace(old_pick, new_pick)
+            changed = True
+
+        if changed:
+            p.write_text(txt, encoding="utf-8")
+            print("✅ Patched spaces.zero.wrappers on disk (fork→spawn + pickling fix).")
+            importlib.reload(wrappers)
+            print("✅ Reloaded spaces.zero.wrappers after patch.")
+        else:
+            print("✅ spaces.zero.wrappers: no disk patch needed (patterns not found or already patched).")
+    except Exception as e:
+        print(f"⚠️ patch_spaces_zero_wrappers_on_disk failed: {e}")
+
+
 def preload_mmgp_fp8_bridge_stubs():
+    """
+    mmgp.offload imports these at import time; ensure they exist before importing mmgp/offload.
+    """
     modname = "mmgp.fp8_quanto_bridge"
     bridge = sys.modules.get(modname)
     if bridge is None:
@@ -123,10 +143,10 @@ def patch_mmgp_offload():
         print(f"⚠️ mmgp offload patch failed: {e}")
 
 
-# ----------------------------
-# 3) Gradio slider clamp (stop Value 0 < min 1 crash)
-# ----------------------------
 def patch_gradio_slider_clamp():
+    """
+    Prevent Gradio slider crash: Value 0 < min 1.0
+    """
     try:
         from gradio.components import Slider
 
@@ -152,10 +172,10 @@ def patch_gradio_slider_clamp():
         print(f"⚠️ Runtime slider clamp patch failed: {e}")
 
 
-# ----------------------------
-# 4) Ensure plugin app exists for wgp.create_ui()
-# ----------------------------
 def ensure_wgp_plugin_app(wgp_module):
+    """
+    wgp.create_ui expects global `app` with plugin methods.
+    """
     if getattr(wgp_module, "app", None) is not None:
         print("[Plugin] wgp.app already present.")
         return
@@ -183,20 +203,24 @@ def ensure_wgp_plugin_app(wgp_module):
         print(f"[Plugin] Using DummyPluginApp (plugins disabled): {e}")
 
 
-# ----------------------------
-# Startup sequence (order matters)
-# ----------------------------
+# ---- Startup order ----
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-patch_spaces_runtime()
+# Patch spaces wrappers BEFORE importing wgp (and before GPU job runs)
+patch_spaces_zero_wrappers_on_disk()
+patch_spaces_zero_wrappers_runtime()
+
+# mmgp stubs before mmgp import
 preload_mmgp_fp8_bridge_stubs()
 patch_mmgp_offload()
+
+# slider clamp
 patch_gradio_slider_clamp()
 
 # Force Wan2GP i2v mode
 sys.argv = ["wgp.py", "--i2v"]
 
-# Import wgp AFTER spaces + multiprocessing patches
+# Import wgp only after the above
 import wgp  # noqa: E402
 
 ensure_wgp_plugin_app(wgp)
