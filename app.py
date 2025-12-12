@@ -4,52 +4,64 @@ import re
 import types
 import pathlib
 
-# Avoid audio backend issues
+# Avoid audio backend issues on HF containers
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-def ensure_fp8_quanto_bridge_module():
+
+# -------------------------------------------------------------------
+# 0) MUST preload mmgp.fp8_quanto_bridge stubs BEFORE importing mmgp/offload
+# -------------------------------------------------------------------
+def preload_mmgp_fp8_bridge_stubs():
     """
-    Create mmgp.fp8_quanto_bridge in sys.modules with the symbols mmgp.offload imports.
-    Must run BEFORE importing wgp (which imports mmgp.offload).
+    mmgp.offload imports these names at import-time:
+      from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format
+    On CPU/ZeroGPU or mismatched mmgp builds, that module may not exist or may be incomplete.
+
+    This function ensures sys.modules contains mmgp.fp8_quanto_bridge with required symbols
+    BEFORE any 'import mmgp' / 'import wgp' happens.
     """
     modname = "mmgp.fp8_quanto_bridge"
-
     bridge = sys.modules.get(modname)
     if bridge is None:
         bridge = types.ModuleType(modname)
         sys.modules[modname] = bridge
 
-    def _noop(*args, **kwargs):
-        return None
-
-    def _convert_scaled_fp8_to_quanto(tensor, *args, **kwargs):
-        # Safe no-op: return tensor unchanged
+    # Safe no-op stubs
+    def convert_scaled_fp8_to_quanto(tensor, *args, **kwargs):
         return tensor
 
-    def _detect_safetensors_format(*args, **kwargs):
+    def detect_safetensors_format(*args, **kwargs):
         return None
 
-    required = {
-        "load_quantized_model": _noop,
-        "enable_fp8_marlin_fallback": _noop,
-        "convert_scaled_fp8_to_quanto": _convert_scaled_fp8_to_quanto,
-        "detect_safetensors_format": _detect_safetensors_format,
-    }
+    def load_quantized_model(*args, **kwargs):
+        return None
 
-    for name, fn in required.items():
-        if not hasattr(bridge, name):
-            setattr(bridge, name, fn)
+    def enable_fp8_marlin_fallback(*args, **kwargs):
+        return None
 
-    print("✅ Preloaded mmgp.fp8_quanto_bridge stubs (ZeroGPU safe).")
+    # Inject/overwrite required attributes
+    bridge.convert_scaled_fp8_to_quanto = convert_scaled_fp8_to_quanto
+    bridge.detect_safetensors_format = detect_safetensors_format
+    bridge.load_quantized_model = load_quantized_model
+    bridge.enable_fp8_marlin_fallback = enable_fp8_marlin_fallback
 
+    print("✅ Preloaded mmgp.fp8_quanto_bridge stubs (offload import safe).")
+
+
+# -------------------------------------------------------------------
+# 1) Patch mmgp.offload to remove torch.nn.Buffer(...) if present
+# -------------------------------------------------------------------
 def patch_mmgp_offload():
-    """Patch mmgp.offload to remove torch.nn.Buffer(...) which breaks on some envs."""
+    """
+    Some mmgp versions reference torch.nn.Buffer(...) in ways that break in certain envs.
+    This patch edits the installed mmgp/offload.py in-place to remove torch.nn.Buffer wrappers.
+    """
     try:
-        import mmgp
+        import mmgp  # noqa: F401
 
         offload_path = pathlib.Path(mmgp.__file__).with_name("offload.py")
         if not offload_path.exists():
-            print("[mmgp] offload.py not found, skipping mmgp patch.")
+            print("⚠️ mmgp offload.py not found, skipping mmgp patch.")
             return
 
         text = offload_path.read_text()
@@ -64,52 +76,32 @@ def patch_mmgp_offload():
                 offload_path.write_text(new_text)
                 print("✅ Patched mmgp.offload (removed torch.nn.Buffer).")
             else:
-                print("✅ mmgp.offload had torch.nn.Buffer string but no change needed.")
+                print("✅ mmgp.offload contained torch.nn.Buffer but no change was needed.")
         else:
             print("✅ torch.nn.Buffer not found in mmgp.offload, no patch necessary.")
     except Exception as e:
         print(f"⚠️ mmgp offload patch failed: {e}")
 
 
-def runtime_patch_mmgp_bridge():
-    """Inject a dummy fp8_quanto_bridge so mmgp doesn't crash on CPU/ZeroGPU."""
-    try:
-        import mmgp
-
-        if hasattr(mmgp, "fp8_quanto_bridge"):
-            print("✅ mmgp.fp8_quanto_bridge already present.")
-            return
-
-        class _DummyBridge:
-            def __getattr__(self, _):
-                return self
-
-            def __call__(self, *args, **kwargs):
-                return self
-
-            def __bool__(self):
-                return False
-
-        dummy = _DummyBridge()
-        mmgp.fp8_quanto_bridge = dummy
-
-        fake_mod = types.ModuleType("mmgp.fp8_quanto_bridge")
-        fake_mod.load_quantized_model = dummy
-        fake_mod.enable_fp8_marlin_fallback = dummy
-        sys.modules["mmgp.fp8_quanto_bridge"] = fake_mod
-
-        print("✅ Injected dummy mmgp.fp8_quanto_bridge.")
-    except Exception as e:
-        print(f"⚠️ Runtime mmgp bridge patch failed: {e}")
-
-
+# -------------------------------------------------------------------
+# 2) Patch spaces.zero.wrappers pickling issue (GradioPartialContext)
+# -------------------------------------------------------------------
 def patch_spaces_zero_pickling():
-    """Patch spaces.zero.wrappers to avoid pickling GradioPartialContext (thread.lock)."""
+    """
+    Fix ZeroGPU crash:
+      _pickle.PicklingError: cannot pickle '_thread.lock' object
+    caused by pickling GradioPartialContext.get() into multiprocessing queue.
+
+    We patch spaces.zero.wrappers in-place:
+      worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))
+      -> worker.arg_queue.put(((args, kwargs), None))
+    """
     try:
-        import spaces.zero.wrappers as wrappers
+        import spaces.zero.wrappers as wrappers  # noqa: F401
 
         wrappers_path = pathlib.Path(wrappers.__file__)
         text = wrappers_path.read_text()
+
         target = "worker.arg_queue.put(((args, kwargs), GradioPartialContext.get()))"
         if target in text:
             new_text = text.replace(
@@ -127,8 +119,13 @@ def patch_spaces_zero_pickling():
         print(f"⚠️ spaces.zero.wrappers patch failed: {e}")
 
 
+# -------------------------------------------------------------------
+# 3) Clamp slider preprocess to avoid "Value 0 is less than minimum value 1.0"
+# -------------------------------------------------------------------
 def patch_gradio_slider_clamp():
-    """Extra safety: clamp slider values to [min,max] before preprocess."""
+    """
+    Gradio can error if slider sends 0 while minimum is 1. Clamp values in preprocess.
+    """
     try:
         from gradio.components import Slider
 
@@ -154,33 +151,29 @@ def patch_gradio_slider_clamp():
         print(f"⚠️ Runtime slider clamp patch failed: {e}")
 
 
-# ---- Apply patches BEFORE importing wgp ----
-
+# -------------------------------------------------------------------
+# Apply patches BEFORE importing wgp (which imports mmgp.offload)
+# -------------------------------------------------------------------
+preload_mmgp_fp8_bridge_stubs()
 patch_mmgp_offload()
-runtime_patch_mmgp_bridge()
 patch_spaces_zero_pickling()
 patch_gradio_slider_clamp()
 
-# Make wgp think it's running in --i2v mode
+# Ensure Wan2GP starts in i2v mode like you want
 sys.argv = ["wgp.py", "--i2v"]
 
+# Import Wan2GP AFTER patches
 import wgp  # noqa: E402
 
-# Hugging Face Gradio Spaces expect a top-level `demo` Blocks object
+# Hugging Face expects a top-level 'demo' Blocks
 try:
     demo = wgp.create_ui()
     print("✅ Built Gradio Blocks via wgp.create_ui().")
-except AttributeError:
-    # Fallback: some versions expose the Blocks as `main`
-    try:
-        demo = wgp.main
-        print("✅ Using wgp.main as Gradio Blocks.")
-    except AttributeError as e:
-        raise RuntimeError(
-            "Could not find a Gradio Blocks object (create_ui or main) in wgp.py"
-        ) from e
+except Exception as e:
+    # If create_ui fails, bubble up with useful message
+    raise RuntimeError(f"Failed to build UI via wgp.create_ui(): {e}") from e
 
 
+# Local run (HF ignores this; it imports demo)
 if __name__ == "__main__":
-    # Local testing: run the app directly
     demo.queue().launch(server_name="0.0.0.0", server_port=7860)
